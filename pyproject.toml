@@ -1,10 +1,10 @@
 [project]
 name = "curl_cffi"
-version = "0.3.2"
+version = "0.5.9b5"
 authors = [{ name = "Yifei Kong", email = "kong@yifei.me" }]
 description = "libcurl ffi bindings for Python, with impersonation support"
 license = { file = "LICENSE" }
-dependencies = ["cffi>=1.0.0"]
+dependencies = ["cffi>=1.12.0"]
 readme = "README.md"
 requires-python = ">=3.7"
 urls = { "repository" = "https://github.com/yifeikong/curl_cffi" }
@@ -68,7 +68,7 @@ packages = ["curl_cffi", "curl_cffi.requests"]
 
 
 [build-system]
-requires = ["wheel", "setuptools", "cffi>=1.0.0"]
+requires = ["wheel", "setuptools", "cffi>=1.12.0"]
 build-backend = "setuptools.build_meta"
 
 
@@ -78,11 +78,23 @@ build-backend = "setuptools.build_meta"
 # skip = ["*-musllinux_*", "*-win32", "*-manylinux_i686"]
 # Building for these platforms is enough since we are using abi3 packages
 build = ["cp37-macosx_x86_64", "cp37-win_amd64", "cp37-manylinux_x86_64", "cp37-manylinux_aarch64"]
-before-all = "python ./prebuild.py"
+before-all = "make preprocess"
 test-requires = "pytest"
 test-command = "pytest {project}/tests/unittest"
 test-extras = ["test"]
 test-skip = "pp*"
 
+[tool.cibuildwheel.macos]
+before-all = "gmake preprocess"
+
+[tool.cibuildwheel.windows]
+before-build = "pip install delvewheel"
+repair-wheel-command = "delvewheel repair --add-path ./lib -w {dest_dir} {wheel}"
+
+
 [tool.isort]
 profile = "black"
+
+[tool.pytest.ini_options]
+# pythonpath = [ "." ]
+asyncio_mode = "auto"

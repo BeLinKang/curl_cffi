@@ -1,61 +1,120 @@
-# Copied from: https://github.com/encode/httpx/blob/master/httpx/_models.py,
+# Adapted from: https://github.com/encode/httpx/blob/master/httpx/_models.py,
 # which is licensed under the BSD License.
 # See https://github.com/encode/httpx/blob/master/LICENSE.md
 
+__all__ = ["Cookies"]
 
-import email.message
+import time
 import typing
 import urllib.request
-import warnings
-from http.cookiejar import Cookie, CookieJar
-from json import loads
+from http.cookiejar import Cookie, CookieJar, eff_request_host  # type: ignore
+from dataclasses import dataclass
 
-from .. import Curl
-from .errors import RequestsError
-from .headers import Headers
+from .errors import CookieConflict
 
 CookieTypes = typing.Union[
     "Cookies", CookieJar, typing.Dict[str, str], typing.List[typing.Tuple[str, str]]
 ]
 
 
-class Request:
-    def __init__(self, url: str, headers: Headers, method: str):
-        self.url = url
-        self.headers = headers
-        self.method = method
+@dataclass
+class CurlMorsel:
+    name: str
+    value: str
+    hostname: str = ""
+    subdomains: bool = False
+    path: str = "/"
+    secure: bool = False
+    expires: int = 0
+    http_only: bool = False
 
+    @staticmethod
+    def parse_bool(s):
+        return s == "TRUE"
 
-class Response:
-    def __init__(self, curl: Curl, request: Request):
-        self.curl = curl
-        self.request = request
-        self.url = ""
-        self.content = b""
-        self.status_code = 200
-        self.reason = "OK"
-        self.ok = True
-        self.headers = Headers()
-        self.cookies = Cookies()
-        self.elapsed = 0.0
-        self.encoding = "utf-8"
-        self.charset = self.encoding
-        self.redirect_count = 0
-        self.redirect_url = ""
+    @staticmethod
+    def dump_bool(s):
+        return "TRUE" if s else "FALSE"
 
-    @property
-    def text(self) -> str:
-        return self.content.decode(self.charset)
+    @classmethod
+    def from_curl_format(cls, set_cookie_line: bytes):
+        (
+            hostname,
+            subdomains,
+            path,
+            secure,
+            expires,
+            name,
+            value,
+        ) = set_cookie_line.decode().split("\t")
+        if hostname and hostname[0] == "#":
+            http_only = True
+            # e.g. #HttpOnly_postman-echo.com
+            domain = hostname[10:]  # len("#HttpOnly_") == 10
+        else:
+            http_only = False
+            domain = hostname
+        return cls(
+            hostname=domain,
+            subdomains=cls.parse_bool(subdomains),
+            path=path,
+            secure=cls.parse_bool(secure),
+            expires=int(expires),
+            name=name,
+            value=value,
+            http_only=http_only,
+        )
 
-    def raise_for_status(self):
-        if not self.ok:
-            raise RequestsError(f"HTTP Error {self.status_code}: {self.reason}")
+    def to_curl_format(self):
+        return "\t".join(
+            [
+                self.hostname,
+                self.dump_bool(self.subdomains),
+                self.path,
+                self.dump_bool(self.secure),
+                str(self.expires),
+                self.name,
+                self.value,
+            ]
+        )
 
-    def json(self, **kw):
-        return loads(self.content, **kw)
+    @classmethod
+    def from_cookiejar_cookie(cls, cookie: Cookie):
+        return cls(
+            name=cookie.name,
+            value=cookie.value or "",
+            hostname=cookie.domain,
+            subdomains=cookie.domain_initial_dot,
+            path=cookie.path,
+            secure=cookie.secure,
+            expires=int(cookie.expires or 0),
+            http_only=False,
+        )
 
-    def close(self):
-        warnings.warn("Deprecated, use Session.close")
+    def to_cookiejar_cookie(self) -> Cookie:
+        # the leading dot actually does not mean anything nowadays
+        # https://stackoverflow.com/a/20884869/1061155
+        # https://github.com/python/cpython/blob/d6555abfa7384b5a40435a11bdd2aa6bbf8f5cfc/Lib/http/cookiejar.py#L1535
+        return Cookie(
+            version=0,
+            name=self.name,
+            value=self.value,
+            port=None,
+            port_specified=False,
+            domain=self.hostname,
+            domain_specified=True,
+            domain_initial_dot=bool(self.hostname.startswith(".")),
+            path=self.path,
+            path_specified=bool(self.path),
+            secure=self.secure,
+            # using if explicitly to make it clear.
+            expires=None if self.expires == 0 else self.expires,
+            discard=True if self.expires == 0 else False,
+            comment=None,
+            comment_url=None,
+            rest=dict(http_only=self.http_only),  # type: ignore
+            rfc2109=False,
+        )
 
 
 class Cookies(typing.MutableMapping[str, str]):
@@ -80,22 +139,32 @@ class Cookies(typing.MutableMapping[str, str]):
         else:
             self.jar = cookies
 
-    def extract_cookies(self, response: Response) -> None:
-        """
-        Loads any cookies based on the response `Set-Cookie` headers.
-        """
-        urllib_response = self._CookieCompatResponse(response)
-        urllib_request = self._CookieCompatRequest(response.request)
-
-        # print("cookies extracted: ", self.jar.make_cookies(urllib_response, urllib_request))
-        self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
-
-    def set_cookie_header(self, request: Request) -> None:
-        """
-        Sets an appropriate 'Cookie:' HTTP header on the `Request`.
-        """
+    def get_cookies_for_curl(self, request) -> typing.List[CurlMorsel]:
+        """the process is similar to `cookiejar.add_cookie_header`"""
         urllib_request = self._CookieCompatRequest(request)
-        self.jar.add_cookie_header(urllib_request)
+        self.jar._cookies_lock.acquire()  # type: ignore
+        try:
+            self.jar._policy._now = self._now = int(time.time())  # type: ignore
+
+            cookies = self.jar._cookies_for_request(urllib_request)  # type: ignore
+            morsels = []
+            for cookie in cookies:
+                morsel = CurlMorsel.from_cookiejar_cookie(cookie)
+                if not morsel.hostname:
+                    _, erhn = eff_request_host(urllib_request)
+                    morsel.hostname = erhn
+                morsels.append(morsel)
+        finally:
+            self.jar._cookies_lock.release()  # type: ignore
+
+        self.jar.clear_expired_cookies()
+        return morsels
+
+    def update_cookies_from_curl(self, morsels: typing.List[CurlMorsel]):
+        for morsel in morsels:
+            cookie = morsel.to_cookiejar_cookie()
+            self.jar.set_cookie(cookie)
+        self.jar.clear_expired_cookies()
 
     def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
         """
@@ -135,14 +204,25 @@ class Cookies(typing.MutableMapping[str, str]):
         in order to specify exactly which cookie to retrieve.
         """
         value = None
+        matched_domain = ""
         for cookie in self.jar:
             if cookie.name == name:
                 if domain is None or cookie.domain == domain:
                     if path is None or cookie.path == path:
-                        if value is not None:
-                            message = f"Multiple cookies exist with name={name}"
+                        # if cookies on two different domains do not share a same value
+                        if (
+                            value is not None
+                            and not matched_domain.endswith(cookie.domain)
+                            and not str(cookie.domain).endswith(matched_domain)
+                            and value != cookie.value
+                        ):
+                            message = (
+                                f"Multiple cookies exist with name={name} on "
+                                f"{matched_domain} and {cookie.domain}"
+                            )
                             raise CookieConflict(message)
                         value = cookie.value
+                        matched_domain = cookie.domain or ""
 
         if value is None:
             return default
@@ -231,7 +311,7 @@ class Cookies(typing.MutableMapping[str, str]):
         for use with `CookieJar` operations.
         """
 
-        def __init__(self, request: Request) -> None:
+        def __init__(self, request) -> None:
             super().__init__(
                 url=str(request.url),
                 headers=dict(request.headers),
@@ -242,21 +322,3 @@ class Cookies(typing.MutableMapping[str, str]):
         def add_unredirected_header(self, key: str, value: str) -> None:
             super().add_unredirected_header(key, value)
             self.request.headers[key] = value
-
-    class _CookieCompatResponse:
-        """
-        Wraps a `Request` instance up in a compatibility interface suitable
-        for use with `CookieJar` operations.
-        """
-
-        def __init__(self, response: Response):
-            self.response = response
-
-        def info(self) -> email.message.Message:
-            info = email.message.Message()
-            for key, value in self.response.headers.multi_items():
-                # Note that setting `info[key]` here is an "append" operation,
-                # not a "replace" operation.
-                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
-                info[key] = value
-            return info

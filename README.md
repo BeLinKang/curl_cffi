@@ -1,42 +1,55 @@
 # curl_cffi
 
 Python binding for [curl-impersonate](https://github.com/lwthiker/curl-impersonate)
-via [CFFI](https://cffi.readthedocs.io/en/latest/).
+via [cffi](https://cffi.readthedocs.io/en/latest/).
 
-Unlike other pure python http clients like `httpx` or `requests`, this package can
+[Documentation](https://curl-cffi.readthedocs.io) | [中文 README](https://github.com/yifeikong/curl_cffi/blob/master/README-zh.md)
+
+Unlike other pure python http clients like `httpx` or `requests`, `curl_cffi` can
 impersonate browsers' TLS signatures or JA3 fingerprints. If you are blocked by some
 website for no obvious reason, you can give this package a try.
 
-[中文文档](README-zh.md)
+## Features
+
+- Supports JA3/TLS and http2 fingerprints impersonation.
+- Much faster than requests/httpx/tls_client, on par with aiohttp/pycurl, see [benchmarks](https://github.com/yifeikong/curl_cffi/tree/master/benchmark).
+- Mimics requests API, no need to learn another one.
+- Pre-compiled, so you don't have to compile on your machine.
+- Supports `asyncio` with proxy rotation on each request.
+- Supports http 2.0, which requests does not.
 
 ## Install
 
-    pip install --upgrade curl_cffi
+    pip install curl_cffi --upgrade
 
-This should work for Linux(x86_64/aarch64), macOS(Intel/Apple Silicon), Windows(amd64).
-If it does not work, you may need to compile and install `curl-impersonate` first.
+This should work on Linux(x86_64/aarch64), macOS(Intel/Apple Silicon) and Windows(amd64).
+If it does not work on you platform, you may need to compile and install `curl-impersonate`
+first and set some environment variables like `LD_LIBRARY_PATH`.
+
+To install beta releases:
+
+    pip install curl_cffi --pre
 
 ## Usage
 
-`requests/httpx`-like API:
+### requests-like
 
 ```python
 from curl_cffi import requests
 
 # Notice the impersonate parameter
-r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome101")
+r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome110")
 
 print(r.json())
-# output: {'ja3_hash': '53ff64ddf993ca882b70e1c82af5da49'
-# the fingerprint should be the same as target browser
+# output: {..., "ja3n_hash": "aa56c057ad164ec4fdcb7a5a283be9fc", ...}
+# the js3n fingerprint should be the same as target browser
 
-# proxies are supported
+# http/socks proxies are supported
 proxies = {"https": "http://localhost:3128"}
-r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome101", proxies=proxies)
+r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome110", proxies=proxies)
 
-# socks proxies are also supported
 proxies = {"https": "socks://localhost:3128"}
-r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome101", proxies=proxies)
+r = requests.get("https://tls.browserleaks.com/json", impersonate="chrome110", proxies=proxies)
 ```
 
 ### Sessions
@@ -53,17 +66,50 @@ print(r.json())
 # {'cookies': {'foo': 'bar'}}
 ```
 
-Supported impersonate versions:
+Supported impersonate versions, as supported by [curl-impersonate](https://github.com/lwthiker/curl-impersonate):
 
 - chrome99
 - chrome100
 - chrome101
 - chrome104
+- chrome107
+- chrome110
 - chrome99_android
 - edge99
 - edge101
 - safari15_3
 - safari15_5
+
+### asyncio
+
+```python
+from curl_cffi.requests import AsyncSession
+
+async with AsyncSession() as s:
+    r = await s.get("https://example.com")
+```
+
+More concurrency:
+
+```python
+import asyncio
+from curl_cffi.requests import AsyncSession
+
+urls = [
+    "https://googel.com/",
+    "https://facebook.com/",
+    "https://twitter.com/",
+]
+
+async with AsyncSession() as s:
+    tasks = []
+    for url in urls:
+        task = s.get("https://example.com")
+        tasks.append(task)
+    results = await asyncio.gather(*tasks)
+```
+
+### curl-like
 
 Alternatively, you can use the low-level curl-like API:
 
@@ -76,7 +122,7 @@ c = Curl()
 c.setopt(CurlOpt.URL, b'https://tls.browserleaks.com/json')
 c.setopt(CurlOpt.WRITEDATA, buffer)
 
-c.impersonate("chrome101")
+c.impersonate("chrome110")
 
 c.perform()
 c.close()
@@ -84,73 +130,10 @@ body = buffer.getvalue()
 print(body.decode())
 ```
 
-See `example.py` or `tests/` for more examples.
-
-## API
-
-Requests: almost the same as requests.
-
-Curl object:
-
-* `setopt(CurlOpt, value)`: Sets curl options as in `curl_easy_setopt`
-* `perform()`: Performs curl request, as in `curl_easy_perform`
-* `getinfo(CurlInfo)`: Gets information in response after curl perform, as in `curl_easy_getinfo`
-* `close()`: Closes and cleans up the curl object, as in `curl_easy_cleanup`
-
-Enum values to be used with `setopt` and `getinfo`, and can be accessed from `CurlOpt` and `CurlInfo`.
-
-## Trouble Shooting
-
-### Pyinstaller `ModuleNotFoundError: No module named '_cffi_backend'`
-
-You need to tell pyinstaller to pack cffi and data files inside the package:
-
-    pyinstaller -F .\example.py --hidden-import=_cffi_backend --collect-all curl_cffi
-
-### Using https proxy, error: `OPENSSL_internal:WRONG_VERSION_NUMBER`
-
-You are messing up https-over-http proxy and https-over-https proxy, for most cases, you
-should change `{"https": "https://localhost:3128"}` to `{"https": "http://localhost:3128"}`.
-Note the protocol in the url for https proxy is `http` not `https`.
-
-See [this issue](https://github.com/yifeikong/curl_cffi/issues/6#issuecomment-1415162495) for a detailed explaination.
-
-## Current Status
-
-This implementation is very hacky now, but it works for most common systems.
-
-When people installing other python curl bindings, like `pycurl`, they often face
-compiling issues or OpenSSL issues, so I really hope that this package can be distributed
-as a compiled binary package, uses would be able to use it by a simple `pip install`, no
-more compile errors.
-
-For now, I just download the pre-compiled `libcurl-impersonate` from github and build a
-bdist wheel, which is a binary package format used by PyPI, and upload it. However, the
-right way is to download curl and curl-impersonate sources on our side and compile them
-all together.
-
-Help wanted!
-
-TODOs:
-
-- [ ] Write docs.
-- [x] Binary package for macOS(Intel/AppleSilicon) and Windows.
-- [ ] Support musllinux(alpine) bdist by building from source.
-- [ ] Exclude the curl headers from source, download them when building.
-- [x] Update curl header files and constants via scripts.
-- [x] Implement `requests.Session/httpx.Client`.
-- [x] Create [ABI3 wheels](https://cibuildwheel.readthedocs.io/en/stable/faq/#abi3) to reduce package size and build time.
-- [ ] Set default headers as in curl-impersonate wrapper scripts.
-
-## Change Log
-
-- 0.3.0, copied more code from `httpx` to support session
-    - Add `requests.Session`
-    - Breaking change: `Response.cookies` changed from `http.cookies.SimpleCookie` to `curl_cffi.requests.Cookies`
-    - Using ABI3 wheels to reduce package size.
+See the [docs](https://curl-cffi.readthedocs.io) for more details.
 
 ## Acknowledgement
 
-- This package was originally forked from https://github.com/multippt/python_curl_cffi
-- headers/cookies files are copied from https://github.com/encode/httpx/blob/master/httpx/_models.py, which is under BSD License.
-
+- Originally forked from [multippt/python_curl_cffi](https://github.com/multippt/python_curl_cffi), which is under the MIT license.
+- Headers/Cookies files are copied from [httpx](https://github.com/encode/httpx/blob/master/httpx/_models.py), which is under the BSD license.
+- Asyncio support is inspired by Tornado's curl http client.
